@@ -2,141 +2,164 @@
 
 declare(strict_types=1);
 
-namespace ACSEO\TypesenseBundle\Transformer;
+namespace ACSEO\TypesenseBundle\EventListener;
 
+use ACSEO\TypesenseBundle\Manager\CollectionManager;
+use ACSEO\TypesenseBundle\Manager\DocumentManager;
+use ACSEO\TypesenseBundle\Transformer\DoctrineToTypesenseTransformer;
 use Doctrine\Common\Util\ClassUtils;
-use Symfony\Component\DependencyInjection\ContainerInterface;
-use Symfony\Component\PropertyAccess\Exception\RuntimeException;
-use Symfony\Component\PropertyAccess\PropertyAccessorInterface;
+use Doctrine\Persistence\Event\LifecycleEventArgs;
 
-class DoctrineToTypesenseTransformer extends AbstractTransformer
+class TypesenseIndexer
 {
-    private $collectionDefinitions;
-    private $entityToCollectionMapping;
-    private $accessor;
-    private $container;
+    private $collectionManager;
+    private $transformer;
+    private $managedClassNames;
+    private DocumentManager $documentManager;
 
-    public function __construct(array $collectionDefinitions, PropertyAccessorInterface $accessor, ContainerInterface $container)
-    {
-        $this->collectionDefinitions = $collectionDefinitions;
-        $this->accessor              = $accessor;
-        $this->container              = $container;
+    private $objetsIdThatCanBeDeletedByObjectHash = [];
+    private $documentsToIndex                     = [];
+    private $documentsToUpdate                    = [];
+    private $documentsToDelete                    = [];
 
-        $this->entityToCollectionMapping = [];
-        foreach ($this->collectionDefinitions as $collection => $collectionDefinition) {
-            $this->entityToCollectionMapping[$collectionDefinition['entity']] = $collection;
-        }
+    public function __construct(
+        CollectionManager $collectionManager,
+        DocumentManager $documentManager,
+        DoctrineToTypesenseTransformer $transformer
+    ) {
+        $this->collectionManager = $collectionManager;
+        $this->documentManager   = $documentManager;
+        $this->transformer       = $transformer;
+
+        $this->managedClassNames  = $this->collectionManager->getManagedClassNames();
     }
 
-    public function convert($entity): array
+    public function postPersist(LifecycleEventArgs $args)
     {
-        $entityClass = ClassUtils::getClass($entity);
+        $entity = $args->getObject();
 
-        // See : https://github.com/acseo/TypesenseBundle/pull/91
-        // Allow subclasses to be recognized as a parent class
-        foreach (array_keys($this->entityToCollectionMapping) as $class) {
-            if (is_a($entityClass, $class, true)) {
-                $entityClass = $class;
-                break;
-            }
-        }
-        
-
-        if (!isset($this->entityToCollectionMapping[$entityClass])) {
-            throw new \Exception(sprintf('Class %s is not supported for Doctrine To Typesense Transformation', $entityClass));
+        if ($this->entityIsNotManaged($entity)) {
+            return;
         }
 
-        $data = [];
+        $collection = $this->getCollectionName($entity);
+        $data       = $this->transformer->convert($entity);
 
-        $fields = $this->collectionDefinitions[$this->entityToCollectionMapping[$entityClass]]['fields'];
-
-        foreach ($fields as $fieldsInfo) {
-            $entityAttribute = $fieldsInfo['entity_attribute'];
-
-            if (str_contains($entityAttribute, '::')) {
-                $value = $this->getFieldValueFromService($entity, $entityAttribute);
-            } else {
-                try {
-                    $value = $this->accessor->getValue($entity, $fieldsInfo['entity_attribute']);
-                } catch (RuntimeException $exception) {
-                    $value = null;
-                }
-            }
-
-            $name = $fieldsInfo['name'];
-
-            $data[$name] = $this->castValue(
-                $entityClass,
-                $name,
-                $value
-            );
-        }
-
-        return $data;
+        $this->documentsToIndex[] = [$collection, $data];
     }
 
-    public function castValue(string $entityClass, string $propertyName, $value)
+    public function postUpdate(LifecycleEventArgs $args)
     {
-        $collection = $this->entityToCollectionMapping[$entityClass];
-        $key        = array_search(
-            $propertyName,
-            array_column(
-                $this->collectionDefinitions[$collection]['fields'],
-                'name'
-            ), true
-        );
-        $collectionFieldsDefinitions = array_values($this->collectionDefinitions[$collection]['fields']);
-        $originalType                = $collectionFieldsDefinitions[$key]['type'];
-        $castedType                  = $this->castType($originalType);
+        $entity = $args->getObject();
 
-        $isOptional = $collectionFieldsDefinitions[$key]['optional'] ?? false;
-
-        switch ($originalType.$castedType) {
-            case self::TYPE_DATETIME.self::TYPE_INT_64:
-                if ($value instanceof \DateTimeInterface) {
-                    return $value->getTimestamp();
-                }
-
-                return null;
-            case self::TYPE_OBJECT.self::TYPE_STRING:
-                if ($isOptional == true && $value == null) {
-                    return null;
-                }
-                if (is_object($value)) {
-                    return method_exists($value, '__toString') ? $value->__toString() : json_encode($value);
-                }
-                return (string) $value;
-            case self::TYPE_COLLECTION.self::TYPE_ARRAY_STRING:
-                return array_values(
-                    $value->map(function ($v) use($isOptional) {
-                        if ($isOptional == true && $v == null) {
-                            return null;
-                        }
-                        return method_exists($v, '__toString') ? $v->__toString() : json_encode($v);
-                    })->toArray()
-                );
-            case self::TYPE_STRING.self::TYPE_STRING:
-            case self::TYPE_PRIMARY.self::TYPE_STRING:
-                return (string) $value;
-            case self::TYPE_BOOL.self::TYPE_BOOL:
-                return (bool) $value;
-            default:
-                return $value;
+        if ($this->entityIsNotManaged($entity)) {
+            return;
         }
+
+        $collectionDefinitionKey = $this->getCollectionKey($entity);
+        $collectionConfig        = $this->collectionManager->getCollectionDefinitions()[$collectionDefinitionKey];
+
+        $this->checkPrimaryKeyExists($collectionConfig);
+
+        $collection = $this->getCollectionName($entity);
+        $data       = $this->transformer->convert($entity);
+
+        $this->documentsToUpdate[] = [$collection, $data['id'], $data];
     }
 
-    private function getFieldValueFromService($entity, $entityAttribute)
+    private function checkPrimaryKeyExists($collectionConfig)
     {
-        $values = explode('::', $entityAttribute);
-
-        if (count($values) === 2) {
-            if ($this->container->has($values[0])) {
-                $service = $this->container->get($values[0]);
-                return call_user_func(array($service, $values[1]), $entity);
+        foreach ($collectionConfig['fields'] as $config) {
+            if ($config['type'] === 'primary') {
+                return;
             }
         }
 
-        return null;
+        throw new \Exception(sprintf('Primary key info have not been found for Typesense collection %s', $collectionConfig['typesense_name']));
     }
 
+    public function preRemove(LifecycleEventArgs $args)
+    {
+        $entity = $args->getObject();
+
+        if ($this->entityIsNotManaged($entity)) {
+            return;
+        }
+
+        $data = $this->transformer->convert($entity);
+
+        $this->objetsIdThatCanBeDeletedByObjectHash[spl_object_hash($entity)] = $data['id'];
+    }
+
+    public function postRemove(LifecycleEventArgs $args)
+    {
+        $entity = $args->getObject();
+
+        $entityHash = spl_object_hash($entity);
+
+        if (!isset($this->objetsIdThatCanBeDeletedByObjectHash[$entityHash])) {
+            return;
+        }
+
+        $collection = $this->getCollectionName($entity);
+
+        $this->documentsToDelete[] = [$collection, $this->objetsIdThatCanBeDeletedByObjectHash[$entityHash]];
+    }
+
+    public function postFlush()
+    {
+        $this->indexDocuments();
+        $this->deleteDocuments();
+
+        $this->resetDocuments();
+    }
+
+    private function indexDocuments()
+    {
+        foreach ($this->documentsToIndex as $documentToIndex) {
+            $this->documentManager->index(...$documentToIndex);
+        }
+        foreach ($this->documentsToUpdate as $documentToUpdate) {
+            $this->documentManager->index($documentToUpdate[0], $documentToUpdate[2]);
+        }
+    }
+
+    private function deleteDocuments()
+    {
+        foreach ($this->documentsToDelete as $documentToDelete) {
+            $this->documentManager->delete(...$documentToDelete);
+        }
+    }
+
+    private function resetDocuments()
+    {
+        $this->documentsToIndex  = [];
+        $this->documentsToUpdate = [];
+        $this->documentsToDelete = [];
+    }
+
+    private function entityIsNotManaged($entity)
+    {
+        $entityClassname = ClassUtils::getClass($entity);
+
+        return !in_array($entityClassname, array_values($this->managedClassNames), true);
+    }
+
+    private function getCollectionName($entity)
+    {
+        $entityClassname = ClassUtils::getClass($entity);
+
+        return array_search($entityClassname, $this->managedClassNames, true);
+    }
+
+    private function getCollectionKey($entity)
+    {
+        $entityClassname = ClassUtils::getClass($entity);
+
+        foreach ($this->collectionManager->getCollectionDefinitions() as $key => $def) {
+            if ($def['entity'] === $entityClassname) {
+                return $key;
+            }
+        }
+    }
 }
