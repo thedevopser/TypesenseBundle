@@ -102,14 +102,17 @@ class DoctrineToTypesenseTransformer extends AbstractTransformer
                 if ($isOptional == true && $value == null) {
                     return null;
                 }
-                return $value->__toString();
+                if (is_object($value)) {
+                    return method_exists($value, '__toString') ? $value->__toString() : json_encode($value);
+                }
+                return (string) $value;
             case self::TYPE_COLLECTION.self::TYPE_ARRAY_STRING:
                 return array_values(
                     $value->map(function ($v) use($isOptional) {
                         if ($isOptional == true && $v == null) {
                             return null;
                         }
-                        return $v->__toString();
+                        return method_exists($v, '__toString') ? $v->__toString() : json_encode($v);
                     })->toArray()
                 );
             case self::TYPE_STRING.self::TYPE_STRING:
