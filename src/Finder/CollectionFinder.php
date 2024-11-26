@@ -56,8 +56,24 @@ class CollectionFinder implements CollectionFinderInterface
         if (count($ids)) {
             $rsm = new ResultSetMappingBuilder($this->em);
             $rsm->addRootEntityFromClassMetadata($this->collectionConfig['entity'], 'e');
-            $tableName       = $this->em->getClassMetadata($this->collectionConfig['entity'])->getTableName();
-            $query           = $this->em->createNativeQuery('SELECT * FROM '.$tableName.' WHERE '.$primaryKeyInfos['entityAttribute'].' IN ('.implode(', ', $ids).') ORDER BY FIELD(id,'.implode(', ', $ids).')', $rsm);
+            $tableName = $this->em->getClassMetadata($this->collectionConfig['entity'])->getTableName();
+            $platform = $this->em->getConnection()->getDatabasePlatform();
+
+            $isPlatformPostgres = $platform instanceof \Doctrine\DBAL\Platforms\PostgreSQLPlatform;
+
+            if ($isPlatformPostgres) {
+                $orderByClause = 'ORDER BY id';
+            } else {
+                $orderByClause = 'ORDER BY FIELD(' . $primaryKeyInfos['entityAttribute'] . ', ' . implode(', ', $ids) . ')';
+            }
+
+            $query = $this->em->createNativeQuery(
+                'SELECT * FROM ' . $tableName .
+                ' WHERE ' . $primaryKeyInfos['entityAttribute'] . ' IN (' . implode(', ', $ids) . ') ' .
+                $orderByClause,
+                $rsm
+            );
+
             $hydratedResults = $query->getResult();
         }
         $results->setHydratedHits($hydratedResults);
