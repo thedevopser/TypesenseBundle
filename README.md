@@ -1,3 +1,5 @@
+# FORKED FROM [acseo/typesense-bundle](https://github.com/acseo/TypesenseBundle)
+
 # ACSEOTypesenseBundle
 
 This bundle provides integration with [Typesense](https://typesense.org/) with Symfony. 
@@ -9,13 +11,15 @@ Features include:
 - Doctrine object transformer to Typesense indexable data
 - Usefull services to search in collections 
 - Listeners for Doctrine events for automatic indexing
+- Added POSTGRESQL ORDER BY instead of MYSQL FIELD
+
 
 ## Installation
 
 Install the bundle using composer 
 
 ```bash
-composer require acseo/typesense-bundle
+composer require thedevopser/typesense-bundle
 ````
 
 Enable the bundle in you Symfony project
