@@ -1,12 +1,12 @@
 {
-    "name": "acseo/typesense-bundle",
-    "description": "This bundle provides integration with Typesense in Symfony",
+    "name": "thedevopser/typesense-bundle",
+    "description": "This bundle provides integration with Typesense in Symfony forked from ACSEO/Typesense-bundle to use woth POSTGRESQL",
     "type": "symfony-bundle",
     "license": "MIT",
     "authors": [
         {
-            "name": "Nicolas Potier",
-            "email": "nicolas.potier@acseo.fr"
+            "name": "TheDevOpser",
+            "email": "sylvain.anglade@gmail.com"
         }
     ],
     "require": {
